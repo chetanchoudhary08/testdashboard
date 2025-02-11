@@ -4,8 +4,9 @@ import time
 import os
 import numpy as np
 import json
-import base64
+import asyncio
 from sentence_transformers import SentenceTransformer
+from openai import AzureOpenAI
 
 # ---------------------------
 # Azure Computer Vision (OCR) Config
@@ -14,16 +15,12 @@ AZURE_ENDPOINT = 'https://visiontestq.cognitiveservices.azure.com/'
 AZURE_SUBSCRIPTION_KEY = '8uBAdXzutVprzehOfze86B8NQFZFFLJLmZxPcEeZROlCU2LPQ9cxJQQJ99BBACYeBjFXJ3w3AAAFACOGSteD'
 
 # ---------------------------
-# Azure OpenAI Config (using AzureOpenAI from OpenAI package)
+# Azure OpenAI Config
 # ---------------------------
-from openai import AzureOpenAI
-
-# Get Azure OpenAI config from environment/Streamlit secrets
 endpoint_url = 'https://cog-dfecc4yseotvi.openai.azure.com/'
 deployment = 'gpt-4o'
 subscription_key = '549b98ee2a85468d8611749e24eac5fe'
 
-# Initialize the Azure OpenAI client with key-based authentication
 client = AzureOpenAI(
     azure_endpoint=endpoint_url,
     api_key=subscription_key,
@@ -31,12 +28,28 @@ client = AzureOpenAI(
 )
 
 # ---------------------------
+# Optimization: Cache Sentence Transformer Model
+# ---------------------------
+@st.cache_resource
+def load_sentence_transformer():
+    return SentenceTransformer('all-MiniLM-L6-v2')
+
+model = load_sentence_transformer()
+
+# ---------------------------
 # Helper Functions
 # ---------------------------
+def cosine_similarity(vec1, vec2):
+    """Compute the cosine similarity between two vectors."""
+    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+
+async def async_extract_text_from_image(image_bytes):
+    """Use Azure OCR asynchronously to extract text from an image."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, extract_text_from_image, image_bytes)
+
 def extract_text_from_image(image_bytes):
-    """
-    Use Azure's Computer Vision Read API to extract text from an image.
-    """
+    """Azure OCR API call to extract text."""
     analyze_url = f"{AZURE_ENDPOINT}/vision/v3.2/read/analyze"
     headers = {
         'Ocp-Apim-Subscription-Key': AZURE_SUBSCRIPTION_KEY,
@@ -45,11 +58,8 @@ def extract_text_from_image(image_bytes):
     
     response = requests.post(analyze_url, headers=headers, data=image_bytes)
     response.raise_for_status()
-    
-    # The API returns an Operation-Location header which contains the URL to poll for the result.
     operation_url = response.headers["Operation-Location"]
     
-    # Poll for the result until it's "succeeded"
     while True:
         result_response = requests.get(operation_url, headers={'Ocp-Apim-Subscription-Key': AZURE_SUBSCRIPTION_KEY})
         result_response.raise_for_status()
@@ -58,25 +68,30 @@ def extract_text_from_image(image_bytes):
             break
         time.sleep(1)
     
-    # Parse and extract text from the result (across all pages)
-    extracted_text = ""
-    read_results = result.get("analyzeResult", {}).get("readResults", [])
-    for page in read_results:
-        for line in page.get("lines", []):
-            extracted_text += line.get("text", "") + " "
+    extracted_text = " ".join(line.get("text", "") for page in result.get("analyzeResult", {}).get("readResults", []) for line in page.get("lines", []))
     return extracted_text.strip()
 
-def cosine_similarity(vec1, vec2):
-    """Compute the cosine similarity between two vectors."""
-    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+async def async_grade_answer(question, total_weightage, student_answer, expected_answer):
+    """Asynchronous grading function to prevent blocking UI."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, grade_answer_with_llm, question, total_weightage, student_answer, expected_answer)
+
+def grade_answer_with_llm(question, total_weightage, student_answer, expected_answer):
+    """Hybrid grading using cosine similarity & Azure OpenAI."""
+    expected_embedding = model.encode(expected_answer).astype(np.float32)
+    student_embedding = model.encode(student_answer).astype(np.float32)
+    
+    similarity = cosine_similarity(student_embedding, expected_embedding)
+    baseline_score = min(similarity * total_weightage, total_weightage)
+    
+    final_judgement = llm_judgement(question, total_weightage, student_answer, expected_answer, similarity)
+    
+    return baseline_score, final_judgement
 
 def llm_judgement(question, total_weightage, student_answer, expected_answer, similarity):
-    """
-    Uses Azure OpenAI (via the AzureOpenAI client) to provide a final evaluation,
-    including a score and detailed feedback.
-    """
+    """Azure OpenAI LLM grading."""
     prompt_text = f"""
-You are an expert educator evaluating student exam answers. Please review the following details and provide a final evaluation.
+You are an expert educator evaluating student exam answers. Please review the details and provide a final evaluation.
 
 Question: {question}
 Total Marks: {total_weightage}
@@ -87,31 +102,20 @@ Expected Answer:
 Student Answer:
 {student_answer}
 
-The cosine similarity between the student's answer and the expected answer is {similarity:.2f} (0 indicates no similarity, and 1 indicates perfect similarity).
+Cosine similarity between expected and student answer: {similarity:.2f} (0 = no similarity, 1 = perfect).
 
-Based on this information, please:
-1. Assign a final score between 0 and {total_weightage}.
-2. Provide detailed feedback highlighting what was done well, what key points may be missing, and any suggestions for improvement.
+Please:
+1. Assign a final score (0 to {total_weightage}).
+2. Provide detailed feedback on correctness, missing points, and improvement.
 
-Your response should be in the following format:
+Format:
 Final Score: <score>
 Feedback: <detailed feedback>
     """
     
-    # Prepare messages in the format expected by Azure OpenAI.
     messages = [
-        {
-            "role": "system",
-            "content": [
-                {"type": "text", "text": "You are an expert educator evaluating student exam answers."}
-            ]
-        },
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt_text}
-            ]
-        }
+        {"role": "system", "content": [{"type": "text", "text": "You are an expert educator evaluating student exam answers."}]},
+        {"role": "user", "content": [{"type": "text", "text": prompt_text}]}
     ]
     
     try:
@@ -123,86 +127,57 @@ Feedback: <detailed feedback>
             top_p=0.95,
             frequency_penalty=0,
             presence_penalty=0,
-            stop=None,
             stream=False
         )
-        # The client returns a response object with a to_json() method.
         response_json = json.loads(completion.to_json())
-        judgement = response_json["choices"][0]["message"]["content"]
+        return response_json["choices"][0]["message"]["content"]
     except Exception as e:
-        judgement = f"Error retrieving LLM judgement: {e}"
-    return judgement
-
-def grade_answer_with_llm(question, total_weightage, student_answer, expected_answer):
-    """
-    Hybrid grading:
-    - Compute a baseline score using cosine similarity (with sentence transformer embeddings).
-    - Use Azure OpenAI to provide a detailed evaluation and final feedback.
-    
-    Returns:
-    - baseline_score: Numeric score from cosine similarity.
-    - final_judgement: LLM's final evaluation.
-    """
-    # Load the sentence transformer model (this may take a moment)
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    
-    # Generate embeddings for expected and student answers
-    expected_embedding = model.encode(expected_answer)
-    student_embedding = model.encode(student_answer)
-    
-    # Compute cosine similarity
-    similarity = cosine_similarity(student_embedding, expected_embedding)
-    
-    # Baseline score: scale the similarity by total_weightage (capped to total_weightage)
-    baseline_score = min(similarity * total_weightage, total_weightage)
-    
-    # Use Azure OpenAI to provide detailed feedback and a final score
-    final_judgement = llm_judgement(question, total_weightage, student_answer, expected_answer, similarity)
-    
-    return baseline_score, final_judgement
+        return f"Error retrieving LLM judgement: {e}"
 
 # ---------------------------
 # Streamlit App UI
 # ---------------------------
-st.title("Hybrid Grading POC (Azure OpenAI)")
-st.write("Upload an image of a handwritten answer. The app will extract text using Azure OCR and grade it using a hybrid approach.")
+st.title("📄 Hybrid Grading System (OCR + AI)")
+st.write("Upload a handwritten answer image to get AI-based grading.")
 
-# Input fields for question details
-question = st.text_area("Enter the Question:", "Explain the process of photosynthesis.")
-expected_answer = st.text_area("Enter the Expected Answer:", 
-"""Photosynthesis is the process by which plants convert light energy into chemical energy.
-It involves the absorption of light by chlorophyll, the conversion of carbon dioxide and water
-into glucose, and the release of oxygen as a byproduct.""")
-total_weightage = st.number_input("Total Marks for the Question:", min_value=1, max_value=100, value=10)
+# Store extracted text and results to avoid unnecessary recomputation
+if "ocr_text" not in st.session_state:
+    st.session_state.ocr_text = None
+if "grading_result" not in st.session_state:
+    st.session_state.grading_result = None
 
-# File uploader for the student's handwritten answer image
-uploaded_file = st.file_uploader("Upload an Image of the Handwritten Answer:", type=["png", "jpg", "jpeg"])
+# User Inputs
+question = st.text_area("Enter the Question:", "Explain photosynthesis.")
+expected_answer = st.text_area("Expected Answer:", "Photosynthesis is the process where plants convert light energy...")
+total_weightage = st.number_input("Total Marks:", min_value=1, max_value=100, value=10)
+uploaded_file = st.file_uploader("Upload Answer Image:", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
-    st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
-    
-    if st.button("Process and Grade"):
-        with st.spinner("Extracting text from image using Azure OCR..."):
+    st.image(uploaded_file, caption="📷 Uploaded Image", use_column_width=True)
+
+    if st.button("Extract Text"):
+        with st.spinner("🔍 Extracting text from image..."):
             image_bytes = uploaded_file.read()
-            try:
-                extracted_text = extract_text_from_image(image_bytes)
-            except Exception as e:
-                st.error(f"Error during OCR extraction: {e}")
-                extracted_text = ""
-        
-        if extracted_text:
-            st.subheader("Extracted Student Answer:")
-            st.write(extracted_text)
-            
-            # Grade the answer using our hybrid grading function
-            with st.spinner("Grading the answer..."):
-                baseline_score, final_judgement = grade_answer_with_llm(
-                    question, total_weightage, extracted_text, expected_answer
-                )
-            
-            st.subheader("Results:")
-            st.write(f"**Baseline Score (from cosine similarity):** {baseline_score:.2f} out of {total_weightage}")
-            st.write("**Azure OpenAI Final Evaluation:**")
-            st.write(final_judgement)
-        else:
-            st.error("No text could be extracted from the image.")
+            extracted_text = extract_text_from_image(image_bytes)
+            if extracted_text:
+                st.session_state.ocr_text = extracted_text
+            else:
+                st.error("❌ No text detected. Try again!")
+
+if st.session_state.ocr_text:
+    st.subheader("📝 Extracted Text:")
+    st.write(st.session_state.ocr_text)
+    
+    if st.button("Grade Answer"):
+        with st.spinner("📊 Evaluating answer..."):
+            baseline_score, final_judgement = grade_answer_with_llm(
+                question, total_weightage, st.session_state.ocr_text, expected_answer
+            )
+            st.session_state.grading_result = (baseline_score, final_judgement)
+
+if st.session_state.grading_result:
+    baseline_score, final_judgement = st.session_state.grading_result
+    st.subheader("🎯 Results:")
+    st.write(f"**Baseline Score:** {baseline_score:.2f} / {total_weightage}")
+    st.write("**AI Final Evaluation:**")
+    st.write(final_judgement)
