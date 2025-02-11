@@ -10,8 +10,8 @@ from sentence_transformers import SentenceTransformer
 # ---------------------------
 # Azure Computer Vision (OCR) Config
 # ---------------------------
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT", st.secrets.get("AZURE_ENDPOINT"))
-AZURE_SUBSCRIPTION_KEY = os.getenv("AZURE_SUBSCRIPTION_KEY", st.secrets.get("AZURE_SUBSCRIPTION_KEY"))
+AZURE_ENDPOINT = 'https://visiontestq.cognitiveservices.azure.com/'
+AZURE_SUBSCRIPTION_KEY = '8uBAdXzutVprzehOfze86B8NQFZFFLJLmZxPcEeZROlCU2LPQ9cxJQQJ99BBACYeBjFXJ3w3AAAFACOGSteD'
 
 # ---------------------------
 # Azure OpenAI Config (using AzureOpenAI from OpenAI package)
@@ -19,9 +19,9 @@ AZURE_SUBSCRIPTION_KEY = os.getenv("AZURE_SUBSCRIPTION_KEY", st.secrets.get("AZU
 from openai import AzureOpenAI
 
 # Get Azure OpenAI config from environment/Streamlit secrets
-endpoint_url = os.getenv("ENDPOINT_URL", st.secrets.get("ENDPOINT_URL"))
-deployment = os.getenv("DEPLOYMENT_NAME", st.secrets.get("DEPLOYMENT_NAME"))
-subscription_key = os.getenv("AZURE_OPENAI_API_KEY", st.secrets.get("AZURE_OPENAI_API_KEY"))
+endpoint_url = 'https://cog-dfecc4yseotvi.openai.azure.com/'
+deployment = 'gpt-4o'
+subscription_key = '549b98ee2a85468d8611749e24eac5fe'
 
 # Initialize the Azure OpenAI client with key-based authentication
 client = AzureOpenAI(
